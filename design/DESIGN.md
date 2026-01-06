@@ -2,9 +2,9 @@
 
 Odin Code will have Three Modes
 
-1. Ask Mode: System prompt focused on research and answering questions. Will not have access to the `Todo Write`, `Write File`
-2. Edit Mode
-3. **Plan Mode:** Data goes into the planner. The planner comes up with a plan on how to gather the required
+1. Ask Mode: System prompt focused on research and answering questions. Will not have access to any tools that can write to files (e.g., `TodoWrite`, `WriteFile`, `EditTool`, `MultiEditTool`, `InitTool`). Only read-only tools are available.
+2. Edit Mode: Full access to all tools including file writing capabilities.
+3. **Plan Mode:** Data goes into the planner. The planner comes up with a plan on how to gather the required information. Will not have access to any tools that can write to files (e.g., `TodoWrite`, `WriteFile`, `EditTool`, `MultiEditTool`, `InitTool`). Only read-only tools are available.
 
 **All modes will use the same architecture**
 `Message -> Planner -> Tool Call -> Planner`
@@ -18,11 +18,14 @@ Each mode will have different system prompts so that they can perform their task
 type State struct {
 	AgentMode AgentMode
 	Messages Message[]
+	MessageQueue QueuedMessage[] // Queued messages when agent is busy
+	IsExecuting bool // Tracks if agent is actively processing a message
 	SubAgents SubAgent[] // Currently running subagent. Each agent kills itself after completion of it's task
 	Context ContextItem[]
 	CustomInstructions string // Data from the ODIN.md
 	Config Config // includes configuration data specifying permissions for the agent. Should be in an odinconfig.json file
 	MessagesMx sync.Mutex // since state is a shared resource we will need to use a mutex to prevent RW race conditions
+	MessageQueueMx sync.Mutex // mutex for message queue
 	SubAgentsMx sync.Mutex //
 	StateMx sync.Mutex // since state is a shared resource we will need to use a mutex to prevent RW race conditions
 	StdinMx sync.Mx // Different concurrent processed might want to use the standard input at the same time. Therefore, it is important we implement mutex locks
@@ -30,9 +33,16 @@ type State struct {
 
 type Message struct {
 	Body string // The actual message sent by the user
+	AnswerSummary string // Final answer/result returned to user after iteration loop completes
 	Todos Todo[] // Can be empty especially if the message was sent in ask mode where it doesnt have access to the TodoWrite tool
 	ToolHistory ToolHistory[] // A list of tools which were called to answer the user's message
 	Updates string[] // String array of realtime updates made to the CLI to inform the user what is going on. When execution is done, we empty the updates array to remove it from the UI.
+}
+
+type QueuedMessage struct {
+	Body string
+	Mode AgentMode // Mode to use when processing this message
+	Timestamp time.Time
 }
 
 type AgentMode string
@@ -95,6 +105,141 @@ func WriteMessageToState (message string, *state State) {
 func PublishState (state *State) {
 // Publish state using redis
 }
+
+func HandleIncomingMessage(state *State, body string, mode AgentMode) {
+	state.StateMx.Lock()
+	isExecuting := state.IsExecuting
+	state.StateMx.Unlock()
+
+	if isExecuting {
+		// Agent is busy - add to queue
+		state.MessageQueueMx.Lock()
+		state.MessageQueue = append(state.MessageQueue, QueuedMessage{
+			Body: body,
+			Mode: mode,
+			Timestamp: time.Now(),
+		})
+		state.MessageQueueMx.Unlock()
+	} else {
+		// Agent is idle - process immediately
+		go ProcessMessage(state, body, mode)
+	}
+}
+
+func ProcessMessage(state *State, body string, mode AgentMode) {
+	// Mark as executing
+	state.StateMx.Lock()
+	state.IsExecuting = true
+	state.AgentMode = mode
+	state.StateMx.Unlock()
+
+	// Add message to history
+	message := Message{Body: body}
+	state.MessagesMx.Lock()
+	state.Messages = append(state.Messages, message)
+	messageIndex := len(state.Messages) - 1
+	state.MessagesMx.Unlock()
+
+	// Get tools for this mode
+	tools := GetModeTools(mode, false)
+
+	// Run iteration loop until task completed
+	taskCompleted := false
+	for !taskCompleted {
+		plannerInput := PlannerInput{
+			LatestMessage: state.Messages[messageIndex],
+			AvailableTools: tools,
+			Context: state.Context,
+			CustomInstructions: state.CustomInstructions,
+			Config: state.Config,
+		}
+
+		plannerOutput := CallPlanner(plannerInput)
+
+		if plannerOutput.TaskCompleted {
+			// Store final answer
+			state.MessagesMx.Lock()
+			state.Messages[messageIndex].AnswerSummary = plannerOutput.Explanation
+			state.MessagesMx.Unlock()
+
+			taskCompleted = true
+		} else {
+			ExecuteTool(plannerOutput.ExecuteTool.ToolName, plannerOutput.ExecuteTool.ToolInput)
+		}
+	}
+
+	// Return result to user (via UI/API)
+	ReturnAnswerToUser(state.Messages[messageIndex].AnswerSummary)
+
+	// Mark as idle
+	state.StateMx.Lock()
+	state.IsExecuting = false
+	state.StateMx.Unlock()
+
+	// Process next message in queue if any
+	ProcessNextMessageInQueue(state)
+}
+
+func ProcessNextMessageInQueue(state *State) {
+	state.MessageQueueMx.Lock()
+
+	if len(state.MessageQueue) == 0 {
+		state.MessageQueueMx.Unlock()
+		return // No more messages
+	}
+
+	// Dequeue first message
+	nextMessage := state.MessageQueue[0]
+	state.MessageQueue = state.MessageQueue[1:]
+	state.MessageQueueMx.Unlock()
+
+	// Process it
+	go ProcessMessage(state, nextMessage.Body, nextMessage.Mode)
+}
+
+func GetModeTools(mode AgentMode, isSubAgent bool) []Tool {
+	// Base tools available to all modes (read-only tools)
+	baseTools := []Tool{
+		TOOL_LIST[ToolNameLS],
+		TOOL_LIST[ToolNameGrep],
+		TOOL_LIST[ToolNameGlob],
+		TOOL_LIST[ToolNameReadFile],
+		TOOL_LIST[ToolNameWebFetch],
+		TOOL_LIST[ToolNameContextSummarizer],
+		TOOL_LIST[ToolNameExecuteCommand],
+        TOOL_LIST[ToolNameTodoWrite],
+	}
+
+	// Start with base tools
+	availableTools := baseTools
+
+	// Add mode-specific tools
+	switch mode {
+	case AgentModeAskMode, AgentModePlanMode:
+		// Ask Mode and Plan Mode: Only read-only tools (baseTools already set)
+		// No additional tools added
+		// Only main agents can spawn subagents
+		if !isSubAgent {
+			availableTools = append(availableTools, TOOL_LIST[ToolNameAgentTool])
+		}
+
+	case EditMode:
+		// Edit Mode: Add all writing tools
+		availableTools = append(availableTools,
+			TOOL_LIST[ToolNameWriteFile],
+			TOOL_LIST[ToolNameEditTool],
+			TOOL_LIST[ToolNameMultiEditTool],
+			TOOL_LIST[ToolNameInitTool],
+		)
+
+		// Only main agents can spawn subagents
+		if !isSubAgent {
+			availableTools = append(availableTools, TOOL_LIST[ToolNameAgentTool])
+		}
+	}
+
+	return availableTools
+}
 ```
 
 ### Agent Design
@@ -107,24 +252,46 @@ type AgentInterface interface {
 }
 
 func NewMainAgent() *MainAgent{}
-func NewSubAgent() *SubAgent{}
+func NewSubAgent(mode AgentMode, parentState *State) *SubAgent{}
 
 // /agents/mainagent/agent.go
 type MainAgent struct {
-	Tools []Tool
+	Tools []Tool // Set dynamically per message
 	State *State
 }
 
+func NewMainAgent() *MainAgent {
+	return &MainAgent{
+		State: &State{},
+	}
+}
+
+func (ma *MainAgent) Execute(body string, mode AgentMode) {
+	ProcessMessage(ma.State, body, mode)
+}
+
 func (ma *Agent) Kill() {}
-func (ma *Agent) Execute() {}
 
 
 // /agents/subagent/agent.go
 type SubAgent struct {
 	Id uint
-	Tools []Tool
+	Tools []Tool // Tools available to this subagent (determined by mode, excluding AgentTool)
 	State *State
 	ParentState *State
+	Mode AgentMode // The mode this subagent was spawned in
+}
+
+func NewSubAgent(mode AgentMode, parentState *State) *SubAgent {
+	// Subagents get tools based on their mode, but NEVER get AgentTool
+	// Subagents under no circumstances can spawn other subagents
+	tools := GetModeTools(mode, true) // isSubAgent = true excludes AgentTool
+	return &SubAgent{
+		Tools: tools,
+		State: &State{},
+		ParentState: parentState,
+		Mode: mode,
+	}
 }
 
 func (sa *Agent) Kill() {
@@ -136,6 +303,7 @@ func (sa *Agent) Execute() {
 	// Call planner on latest Message
 	// Planner calls tools and resumes iteration loop
 	// When the problem has been solved, we end the execution and kill the agent
+	// Note: Subagents cannot spawn other subagents - AgentTool is not in their tool list
 	return sa.Kill()
 }
 
@@ -197,8 +365,19 @@ type Tool interface {
 
 type ToolName string
 const (
+	ToolNameLS ToolName = "LS"
+	ToolNameGrep ToolName = "Grep"
+	ToolNameGlob ToolName = "Glob"
+	ToolNameReadFile ToolName = "ReadFile"
+	ToolNameWriteFile ToolName = "WriteFile"
+	ToolNameEditTool ToolName = "EditTool"
+	ToolNameMultiEditTool ToolName = "MultiEditTool"
 	ToolNameTodoWrite ToolName = "TodoWrite"
-	// other tool names...
+	ToolNameAgentTool ToolName = "AgentTool"
+	ToolNameWebFetch ToolName = "WebFetch"
+	ToolNameContextSummarizer ToolName = "ContextSummarizer"
+	ToolNameInitTool ToolName = "InitTool"
+	ToolNameExecuteCommand ToolName = "ExecuteCommand"
 )
 
 const TOOL_LIST = map[ToolName]Tool{
@@ -460,7 +639,7 @@ A tool for making multiple edits to a single file in one operation. It is an ato
 
 **Critical Requirements:**
 
-- **Atomicity:** If one edit fails (e.g., a string isn't found), the entire operation fails.
+- **Atomicity:** If one edit fails (e.g., a string isn't found), the entire operation fails.`
 - **Sequential Logic:** Edits are applied in order. An early edit might change the text that a later edit is looking for—plan accordingly. (Might be benefifical to carry out the edits in a loop)
 - **Strictness:** Requires absolute paths and exact whitespace matching.
 - **File Creation:** Should not be able to create new files. To create new files, use the WriteFile tool
@@ -507,7 +686,14 @@ A tool for making multiple edits to a single file in one operation. It is an ato
 
 ##### AgentTool
 
-A subagent spawned by the main loop for running smaller complex tasks. Has it's own planner, tools and runs an iteration loop similar to the main loop. Doesn't have access to the Agent Tool i.e a subagent cannot spawn another subagent.
+A subagent spawned by the main agent for running smaller complex tasks. Has it's own planner, tools and runs an iteration loop similar to the main loop.
+
+**Critical Restrictions:**
+
+- **Only main agents can use AgentTool**: Subagents under no circumstances can spawn other subagents. The `GetModeTools` function automatically excludes `AgentTool` when `isSubAgent = true`.
+- When a subagent is spawned, it receives only the tools available in the current mode (via `GetModeTools(mode, true)`), which explicitly excludes `AgentTool`.
+- Subagents are spawned with a specific mode and inherit the tool restrictions of that mode, but never receive `AgentTool` regardless of mode.
+
 TODO: Figure out how to orchestrate
 
 ##### WebFetch Tool
@@ -555,6 +741,108 @@ Looks through the codebase searching for data on the underlying architecture of 
    TODO Write detailed notes on how and where to retrieve this information from
    Input Object
    `no data`
+
+### Message Queue & Dynamic Mode Switching
+
+#### Message Queue System
+
+Odin Code implements an automatic message queuing system that enables users to send multiple commands sequentially without waiting for each response. This improves workflow for automation and complex multi-step tasks.
+
+**How It Works:**
+
+1. **Idle State**: When the agent is not processing a message (`IsExecuting = false`), incoming messages are processed immediately via `HandleIncomingMessage()`.
+
+2. **Busy State**: When the agent is actively processing a message (`IsExecuting = true`), new incoming messages are automatically added to `MessageQueue[]` for sequential processing.
+
+3. **Sequential Processing**: Each message in the queue is processed completely—running a full iteration loop until `TaskCompleted = true`—before the next message is dequeued.
+
+4. **Automatic Dequeuing**: After completing a message and returning the answer to the user, the system automatically checks `MessageQueue[]` and processes the next message if one exists.
+
+**Key Components:**
+
+- `MessageQueue []QueuedMessage`: Array that stores queued messages with their body, mode, and timestamp
+- `IsExecuting bool`: Flag that tracks whether the agent is actively processing a message
+- `MessageQueueMx sync.Mutex`: Mutex to prevent race conditions when accessing the queue
+- `HandleIncomingMessage()`: Routes messages to queue or immediate processing based on `IsExecuting` state
+- `ProcessMessage()`: Processes a single message completely through the full iteration loop
+- `ProcessNextMessageInQueue()`: Dequeues and processes the next message after current message completes
+
+#### Sequential Processing Flow
+
+Each message is processed independently and completely:
+
+1. Message received → Check `IsExecuting`
+2. If busy → Add to `MessageQueue[]`, if idle → Start processing
+3. Set `IsExecuting = true` and `AgentMode = mode`
+4. Add message to `Messages[]` history
+5. Get tools for the mode: `GetModeTools(mode, false)`
+6. Run iteration loop: `Planner → Tool Call → Planner` until `TaskCompleted = true`
+7. Store final answer in `Message.AnswerSummary`
+8. Return answer to user via UI/API
+9. Set `IsExecuting = false`
+10. Check `MessageQueue[]` → If messages exist, dequeue and process next
+
+**Benefits:**
+
+- **No Interruptions**: No mid-execution message merging or complex state management
+- **Clean Separation**: One message → One iteration loop → One answer
+- **Rapid Input**: Users can type multiple commands quickly without waiting
+- **Mode Flexibility**: Each queued message can specify a different mode
+- **Simple Logic**: Straightforward queue-based architecture
+
+#### Dynamic Mode Switching
+
+The agent is not locked to a specific mode. Each message can specify its own mode, and the system dynamically adjusts:
+
+**Mode per Message:**
+
+- Each `QueuedMessage` stores its mode alongside the message body
+- When processing a message, `ProcessMessage()` sets `state.AgentMode = mode`
+- Tools are retrieved dynamically: `GetModeTools(mode, false)`
+- Different modes available: `ask_mode`, `plan_mode`, `edit_mode`
+
+**Mode-Specific Tool Access:**
+
+- **Ask Mode & Plan Mode**: Only read-only tools (LS, Grep, Glob, ReadFile, WebFetch, ContextSummarizer, ExecuteCommand, TodoWrite)
+- **Edit Mode**: All tools including file-writing tools (WriteFile, EditTool, MultiEditTool, InitTool)
+- **Main Agent**: Can spawn subagents via AgentTool in any mode
+- **SubAgent**: Cannot spawn subagents (AgentTool excluded when `isSubAgent = true`)
+
+**Example Flow:**
+
+```
+User sends Message 1 (mode: ask_mode) → Processing...
+User sends Message 2 (mode: edit_mode) → Queued
+User sends Message 3 (mode: plan_mode) → Queued
+Message 1 completes → Returns answer
+Message 2 dequeued → Processes in edit_mode with writing tools
+Message 2 completes → Returns answer
+Message 3 dequeued → Processes in plan_mode with read-only tools
+Message 3 completes → Returns answer
+```
+
+#### State Management
+
+**IsExecuting Flag:**
+
+- Set to `true` at the start of `ProcessMessage()`
+- Set to `false` after message processing completes and answer is returned
+- Used by `HandleIncomingMessage()` to determine routing (queue vs. immediate)
+- Provides clear system state visibility
+
+**Thread Safety:**
+
+- All state mutations protected by appropriate mutexes
+- `StateMx`: Protects `IsExecuting` and `AgentMode`
+- `MessageQueueMx`: Protects `MessageQueue[]` array
+- `MessagesMx`: Protects `Messages[]` array
+- Prevents race conditions in concurrent processing
+
+**Message History:**
+
+- Each processed message stored in `Messages[]` with full context
+- Includes: `Body`, `AnswerSummary`, `Todos[]`, `ToolHistory[]`, `Updates[]`
+- Provides complete audit trail of all interactions
 
 ### SafeGuards
 
