@@ -24,11 +24,18 @@ type State struct {
 	Context ContextItem[]
 	CustomInstructions string // Data from the ODIN.md
 	Config Config // includes configuration data specifying permissions for the agent. Should be in an odinconfig.json file
+
+	// File Cache System - treats file data as key-value cache
+	FileCache map[string]*CachedFile // filepath -> cached file data
+	FileCacheConfig FileCacheConfig // Configuration for cache behavior
+
+	// Mutexes for thread safety
 	MessagesMx sync.Mutex // since state is a shared resource we will need to use a mutex to prevent RW race conditions
 	MessageQueueMx sync.Mutex // mutex for message queue
 	SubAgentsMx sync.Mutex //
 	StateMx sync.Mutex // since state is a shared resource we will need to use a mutex to prevent RW race conditions
 	StdinMx sync.Mx // Different concurrent processed might want to use the standard input at the same time. Therefore, it is important we implement mutex locks
+	FileCacheMx sync.RWMutex // RWMutex for read-heavy file cache operations
 }
 
 type Message struct {
@@ -86,6 +93,61 @@ type ContextItem struct {
 	FilePath *string // context might come from a command result
 	SourceCommand *string // source command for the data if the data is a result from a cli command
 }
+
+// File Cache Types - implements efficient key-value cache for file data
+// Cache structure mirrors actual read operations from tools
+type CachedFile struct {
+	FilePath     string    // Absolute file path (serves as the key)
+
+	// Content storage - structure determined by actual reads, not file size
+	FullContent  *string   // Full file contents (when tool reads entire file)
+	PartialCache map[string]*CachedSegment // Line range segments (when tool reads specific ranges)
+	IsPartial    bool      // True if PartialCache is used, false if FullContent
+
+	// File metadata
+	ContentHash  string    // SHA-256 hash for integrity checking (full file)
+	Size         int64     // Total file size in bytes
+	TotalLines   int       // Total number of lines in file
+
+	// Timestamps for cache management
+	CachedAt     time.Time // When file was first cached
+	LastAccessed time.Time // For LRU eviction
+	AccessCount  int       // Usage tracking
+	ModTime      time.Time // File modification time from filesystem
+
+	// State tracking
+	IsModified   bool      // Track if file was written in this session
+	OriginalHash string    // Hash at first read (for dirty detection)
+}
+
+// CachedSegment represents a cached portion of a file
+// Created when tool reads specific line ranges (e.g., Grep with offset/limit)
+type CachedSegment struct {
+	StartLine    int       // Starting line number (1-based)
+	EndLine      int       // Ending line number (inclusive)
+	Content      string    // The actual content of this segment
+	Hash         string    // Hash of this segment
+	CachedAt     time.Time // When this segment was cached
+}
+
+type FileCacheConfig struct {
+	MaxCacheSize     int64          // Total cache size in bytes (e.g., 100MB)
+	MaxFileSize      int64          // Max size per file (e.g., 10MB)
+	MaxEntries       int            // Max number of cached files (e.g., 500)
+	EvictionPolicy   EvictionPolicy // LRU, LFU, or Hybrid
+	TTL              time.Duration  // Optional: expire after duration
+	EnableAutoRefresh bool          // Re-read if mod time changed
+
+	// Partial caching settings - cache structure mirrors actual reads
+	MaxSegments      int            // Max segments per file (e.g., 50)
+}
+
+type EvictionPolicy string
+const (
+	EvictionPolicyLRU    EvictionPolicy = "lru"    // Least Recently Used
+	EvictionPolicyLFU    EvictionPolicy = "lfu"    // Least Frequently Used
+	EvictionPolicyHybrid EvictionPolicy = "hybrid" // Prefer evicting unmodified files
+)
 ```
 
 **Helper Functions**
@@ -104,6 +166,303 @@ func WriteMessageToState (message string, *state State) {
 
 func PublishState (state *State) {
 // Publish state using redis
+}
+
+// File Cache Helper Functions
+
+func NewDefaultFileCacheConfig() FileCacheConfig {
+	return FileCacheConfig{
+		MaxCacheSize:      100 * 1024 * 1024,  // 100MB
+		MaxFileSize:       10 * 1024 * 1024,   // 10MB per file
+		MaxEntries:        500,                 // 500 files max
+		EvictionPolicy:    EvictionPolicyHybrid, // Prefer evicting unmodified
+		TTL:               0,                   // No expiration by default
+		EnableAutoRefresh: true,                // Auto-detect file changes
+
+		// Partial caching follows actual reads
+		MaxSegments:       50,                  // Max 50 segments per file
+	}
+}
+
+// Cache Eviction Strategies
+
+// EvictLRU - Evicts least recently used file
+func (s *State) EvictLRU() {
+	s.FileCacheMx.Lock()
+	defer s.FileCacheMx.Unlock()
+
+	var oldestPath string
+	var oldestTime time.Time = time.Now()
+
+	for path, cached := range s.FileCache {
+		if cached.LastAccessed.Before(oldestTime) {
+			oldestTime = cached.LastAccessed
+			oldestPath = path
+		}
+	}
+
+	if oldestPath != "" {
+		delete(s.FileCache, oldestPath)
+	}
+}
+
+// EvictHybrid - Prefers evicting unmodified files, then uses LRU
+func (s *State) EvictHybrid() {
+	s.FileCacheMx.Lock()
+	defer s.FileCacheMx.Unlock()
+
+	var targetPath string
+	var oldestUnmodified time.Time = time.Now()
+	var oldestModified time.Time = time.Now()
+	var hasUnmodified bool
+	var oldestModifiedPath string
+
+	// Find oldest unmodified and modified files
+	for path, cached := range s.FileCache {
+		if !cached.IsModified {
+			hasUnmodified = true
+			if cached.LastAccessed.Before(oldestUnmodified) {
+				oldestUnmodified = cached.LastAccessed
+				targetPath = path
+			}
+		} else {
+			if cached.LastAccessed.Before(oldestModified) {
+				oldestModified = cached.LastAccessed
+				oldestModifiedPath = path
+			}
+		}
+	}
+
+	// Prefer evicting unmodified files
+	if !hasUnmodified && oldestModifiedPath != "" {
+		targetPath = oldestModifiedPath
+	}
+
+	if targetPath != "" {
+		delete(s.FileCache, targetPath)
+	}
+}
+
+// NeedsEviction - Checks if cache needs eviction before adding new file
+func (s *State) NeedsEviction(newFileSize int64) bool {
+	config := s.FileCacheConfig
+
+	// Check entry count
+	if len(s.FileCache) >= config.MaxEntries {
+		return true
+	}
+
+	// Check total size
+	currentSize := int64(0)
+	for _, cached := range s.FileCache {
+		currentSize += cached.Size
+	}
+
+	return currentSize + newFileSize > config.MaxCacheSize
+}
+
+// GetCachedFile - Thread-safe cache lookup
+func (s *State) GetCachedFile(filePath string) (*CachedFile, bool) {
+	s.FileCacheMx.RLock()
+	defer s.FileCacheMx.RUnlock()
+
+	cached, exists := s.FileCache[filePath]
+	return cached, exists
+}
+
+// UpdateCacheAccess - Updates access tracking for cache entry
+func (s *State) UpdateCacheAccess(filePath string) {
+	s.FileCacheMx.Lock()
+	defer s.FileCacheMx.Unlock()
+
+	if cached, exists := s.FileCache[filePath]; exists {
+		cached.LastAccessed = time.Now()
+		cached.AccessCount++
+		s.FileCache[filePath] = cached
+	}
+}
+
+// GetCachedSegment - Retrieves a specific segment from partial cache
+func (s *State) GetCachedSegment(filePath string, startLine, endLine int) (*CachedSegment, bool) {
+	s.FileCacheMx.RLock()
+	defer s.FileCacheMx.RUnlock()
+
+	cached, exists := s.FileCache[filePath]
+	if !exists || !cached.IsPartial {
+		return nil, false
+	}
+
+	key := fmt.Sprintf("%d-%d", startLine, endLine)
+	segment, found := cached.PartialCache[key]
+	return segment, found
+}
+
+// AddCachedSegment - Adds a segment to partial cache
+func (s *State) AddCachedSegment(filePath string, segment *CachedSegment) {
+	s.FileCacheMx.Lock()
+	defer s.FileCacheMx.Unlock()
+
+	cached, exists := s.FileCache[filePath]
+	if !exists {
+		// Create new partial cache entry
+		cached = &CachedFile{
+			FilePath:     filePath,
+			IsPartial:    true,
+			PartialCache: make(map[string]*CachedSegment),
+			CachedAt:     time.Now(),
+			LastAccessed: time.Now(),
+			AccessCount:  1,
+		}
+		s.FileCache[filePath] = cached
+	}
+
+	if cached.PartialCache == nil {
+		cached.PartialCache = make(map[string]*CachedSegment)
+	}
+
+	// Add segment with range key
+	key := fmt.Sprintf("%d-%d", segment.StartLine, segment.EndLine)
+	cached.PartialCache[key] = segment
+
+	// Evict oldest segments if over limit
+	if len(cached.PartialCache) > s.FileCacheConfig.MaxSegments {
+		s.evictOldestSegment(cached)
+	}
+}
+
+// evictOldestSegment - Removes oldest segment from partial cache
+func (s *State) evictOldestSegment(cached *CachedFile) {
+	var oldestKey string
+	var oldestTime time.Time = time.Now()
+
+	for key, segment := range cached.PartialCache {
+		if segment.CachedAt.Before(oldestTime) {
+			oldestTime = segment.CachedAt
+			oldestKey = key
+		}
+	}
+
+	if oldestKey != "" {
+		delete(cached.PartialCache, oldestKey)
+	}
+}
+
+// ValidateCacheSufficiencyForEdit - Uses LLM to check if cached content is sufficient for edit
+func (s *State) ValidateCacheSufficiencyForEdit(filePath, oldString, newString string) (bool, string, error) {
+	s.FileCacheMx.RLock()
+	cached, exists := s.FileCache[filePath]
+	s.FileCacheMx.RUnlock()
+
+	if !exists {
+		return false, "File not in cache. Must read file before editing.", nil
+	}
+
+	// Gather all cached content (full or partial)
+	var cachedContent string
+	var segmentInfo []string
+
+	if cached.IsPartial {
+		// Collect all cached segments
+		for key, segment := range cached.PartialCache {
+			cachedContent += fmt.Sprintf("\n--- Lines %d-%d ---\n%s",
+				segment.StartLine, segment.EndLine, segment.Content)
+			segmentInfo = append(segmentInfo, key)
+		}
+	} else {
+		// Full content available
+		if cached.FullContent != nil {
+			cachedContent = *cached.FullContent
+		}
+	}
+
+	// Call LLM to validate sufficiency
+	validationInput := CacheSufficiencyValidationInput{
+		FilePath:      filePath,
+		OldString:     oldString,
+		NewString:     newString,
+		CachedContent: cachedContent,
+		IsPartial:     cached.IsPartial,
+		SegmentKeys:   segmentInfo,
+	}
+
+	result := CallCacheSufficiencyValidator(validationInput)
+	return result.IsSufficient, result.Explanation, nil
+}
+
+type CacheSufficiencyValidationInput struct {
+	FilePath      string
+	OldString     string
+	NewString     string
+	CachedContent string
+	IsPartial     bool
+	SegmentKeys   []string
+}
+
+type CacheSufficiencyValidationOutput struct {
+	IsSufficient bool   // true if cache has enough info for the edit
+	Explanation  string // explanation of decision
+	SuggestedLineRanges []LineRange // if insufficient, which ranges to read
+}
+
+type LineRange struct {
+	StartLine int
+	EndLine   int
+	Reason    string // why this range is needed
+}
+
+// CallCacheSufficiencyValidator - Calls cheap LLM to validate cache sufficiency
+func CallCacheSufficiencyValidator(input CacheSufficiencyValidationInput) CacheSufficiencyValidationOutput {
+	// Use cheap, fast model (e.g., Haiku, GPT-4o-mini)
+	prompt := BuildCacheSufficiencyPrompt(input)
+
+	// Call LLM with structured output
+	response := CallLLM(prompt, "haiku") // Use cheapest model
+
+	return ParseCacheSufficiencyResponse(response)
+}
+
+func BuildCacheSufficiencyPrompt(input CacheSufficiencyValidationInput) string {
+	cacheType := "full file"
+	if input.IsPartial {
+		cacheType = fmt.Sprintf("partial (segments: %v)", input.SegmentKeys)
+	}
+
+	return fmt.Sprintf(`You are a cache sufficiency validator. Your job is to determine if cached file content contains enough information to perform a requested edit operation.
+
+**File**: %s
+**Cache Type**: %s
+**Requested Edit**:
+- Replace: "%s"
+- With: "%s"
+
+**Cached Content**:
+%s
+
+**Your Task**:
+Analyze whether the cached content contains sufficient information to safely perform this edit. Consider:
+
+1. Does the cached content include the old_string to be replaced?
+2. If partial cache: Does it include the surrounding context needed to understand the change?
+3. Are there multiple potential matches? If so, is there enough context to distinguish them?
+4. Could this edit affect code/content outside the cached regions?
+
+**Response Format** (JSON):
+{
+  "is_sufficient": true/false,
+  "explanation": "Brief explanation of your decision",
+  "suggested_line_ranges": [
+    {"start_line": 100, "end_line": 150, "reason": "Contains the target string"}
+  ]
+}
+
+**Guidelines**:
+- If full file is cached: almost always sufficient unless old_string not found
+- If partial cache: check if segments contain old_string AND enough context
+- If old_string not found in any cached segment: not sufficient
+- If found but near segment boundaries: suggest expanded range for safety
+- Be conservative: when in doubt, request more context
+
+Respond with JSON only.`, input.FilePath, cacheType, input.OldString, input.NewString, input.CachedContent)
 }
 
 func HandleIncomingMessage(state *State, body string, mode AgentMode) {
@@ -146,12 +505,27 @@ func ProcessMessage(state *State, body string, mode AgentMode) {
 	// Run iteration loop until task completed
 	taskCompleted := false
 	for !taskCompleted {
+		// Build cached files info for planner
+		state.FileCacheMx.RLock()
+		cachedFiles := make([]CachedFileInfo, 0, len(state.FileCache))
+		for path, cached := range state.FileCache {
+			cachedFiles = append(cachedFiles, CachedFileInfo{
+				FilePath:    path,
+				Size:        cached.Size,
+				IsModified:  cached.IsModified,
+				CachedAt:    cached.CachedAt,
+				IsTruncated: cached.IsTruncated,
+			})
+		}
+		state.FileCacheMx.RUnlock()
+
 		plannerInput := PlannerInput{
 			LatestMessage: state.Messages[messageIndex],
 			AvailableTools: tools,
 			Context: state.Context,
 			CustomInstructions: state.CustomInstructions,
 			Config: state.Config,
+			CachedFiles: cachedFiles,
 		}
 
 		plannerOutput := CallPlanner(plannerInput)
@@ -203,7 +577,6 @@ func GetModeTools(mode AgentMode, isSubAgent bool) []Tool {
 		TOOL_LIST[ToolNameLS],
 		TOOL_LIST[ToolNameGrep],
 		TOOL_LIST[ToolNameGlob],
-		TOOL_LIST[ToolNameReadFile],
 		TOOL_LIST[ToolNameWebFetch],
 		TOOL_LIST[ToolNameContextSummarizer],
 		TOOL_LIST[ToolNameExecuteCommand],
@@ -316,6 +689,7 @@ This will be the brain of the entire system. It has three main tasks.
 
 1. Figure out the next logical step to take
 2. Identify when the problem has been solved to end the iteration (planner -> tool call) loop
+3. Leverage the FileCache to avoid redundant file reads and ensure current context
    **Planner Input**
 
 ```go
@@ -325,6 +699,18 @@ type PlannerInput struct{
 	Context ContextItem[] // context retrieved from state
 	CustomInstructions string // Data from the ODIN.md
 	Config Config
+
+	// File Cache Information - exposes cached files to planner
+	CachedFiles []CachedFileInfo // List of files currently in cache
+}
+
+// CachedFileInfo provides cache metadata to planner
+type CachedFileInfo struct {
+	FilePath    string    // Absolute file path (the cache key)
+	Size        int64     // File size in bytes
+	IsModified  bool      // Whether file was modified in this session
+	CachedAt    time.Time // When file was cached
+	IsTruncated bool      // Whether content was truncated for size
 }
 
 type ToolDescription struct{
@@ -350,6 +736,31 @@ type PlannerOutput struct {
 **TODO**: Figure out how to manage context
 **TODO**: Figure out exact conditions to end iteration loop
 
+#### Planner Cache Usage
+
+The planner receives `CachedFiles` information in its input, allowing it to:
+
+1. **Avoid Redundant Reads**: Check if a file is already cached before calling ReadFile
+2. **Reference Cached Content**: Use cached file data without re-reading from disk
+3. **Track Modified Files**: See which files have been edited (IsModified=true) in this session
+4. **Ensure Freshness**: The cache automatically validates file freshness using ModTime
+
+**Planner Instructions for Cache Usage:**
+
+```
+You have access to a file cache that tracks recently read files:
+- Files listed in CachedFiles have already been read and their content is available
+- Files with IsModified=true have been edited in this session
+- The cache automatically handles freshness validation
+- Grep tool automatically caches files when reading content (output_mode="content")
+- Before editing any file, it MUST be in the cache (enforced by EditTool PreHook)
+
+Available cached files:
+{{range .CachedFiles}}
+- {{.FilePath}} ({{.Size}} bytes, cached {{.CachedAt}}, modified={{.IsModified}})
+{{end}}
+```
+
 ### Tool Call
 
 These are the various tools the planner can call
@@ -368,7 +779,6 @@ const (
 	ToolNameLS ToolName = "LS"
 	ToolNameGrep ToolName = "Grep"
 	ToolNameGlob ToolName = "Glob"
-	ToolNameReadFile ToolName = "ReadFile"
 	ToolNameWriteFile ToolName = "WriteFile"
 	ToolNameEditTool ToolName = "EditTool"
 	ToolNameMultiEditTool ToolName = "MultiEditTool"
@@ -457,7 +867,13 @@ Use this tool proactively in these scenarios:
 
 ##### LS (LS Tool)
 
-Lists files and directories in a given path. The path parameter must be an absolute path, not a relative path. You can optionally provide an array of glob patterns to ignore with the ignore parameter. You should generally prefer the Glob and Grep tools, if you know which directories to search.
+Lists files and directories in a given path with cache awareness. The path parameter must be an absolute path, not a relative path. You can optionally provide an array of glob patterns to ignore with the ignore parameter. You should generally prefer the Glob and Grep tools, if you know which directories to search.
+
+**Cache Integration:**
+
+- Can indicate which listed files are already in FileCache
+- Provides cache status in output (cached/uncached indicator)
+- Does not automatically cache files (only lists them)
 
 **Input Schema**
 
@@ -485,7 +901,27 @@ Lists files and directories in a given path. The path parameter must be an absol
 
 ##### Grep
 
-A powerful search tool built on ripgrep
+A powerful search tool built on ripgrep with integrated file caching. When reading file contents, Grep automatically caches files in the FileCache map using filepaths as keys, preventing redundant disk reads and ensuring content freshness.
+
+**Cache Integration:**
+
+- When `output_mode` is "content": caches file contents automatically
+- Checks FileCache first before reading from disk (O(1) lookup by filepath)
+- Validates cache freshness using file ModTime
+- Updates cache with file content and metadata after reading
+- Implements smart eviction when cache limits are exceeded
+- Marks which files have been read for EditTool validation
+
+**Partial Caching Based on Read Behavior:**
+
+- Cache structure mirrors what was actually read by the tool
+- Grep with `offset`/`limit` parameters → Partial cache (only those lines)
+- Grep reading entire file → Full cache (complete content)
+- Each segment is cached with its own key: "startLine-endLine"
+- Maintains up to 50 segments per file (configurable)
+- Context lines (-A/-B/-C) determine segment boundaries
+- Example: grep with offset=100, limit=50 caches lines 100-150 as one segment
+
 **Input Schema**
 
 ```json
@@ -550,12 +986,18 @@ A powerful search tool built on ripgrep
 
 ##### Glob
 
-Fast file pattern matching tool that works with any codebase size
+Fast file pattern matching tool that works with any codebase size with integrated caching
 
 - Supports glob patterns like "\*\*/\*.js" or "src/\*\*/\*.ts"
 - Returns matching file paths sorted by modification time
 - Use this tool when you need to find files by name patterns
 - When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead
+
+**Cache Integration:**
+
+- When returning file contents (optional feature): caches in FileCache
+- Can check cache to identify which files have already been read
+- Updates file metadata in cache when accessing files
 
 ```json
 {
@@ -578,7 +1020,14 @@ Fast file pattern matching tool that works with any codebase size
 
 ##### WriteFile
 
-Overwrites an existing file in the filesystem.
+Overwrites an existing file in the filesystem and updates the FileCache.
+
+**Cache Behavior:**
+
+- Creates or updates FileCache entry with new content
+- Marks file as IsModified=true in cache
+- Computes and stores new content hash
+- Updates ModTime to reflect filesystem change
 
 ```json
 {
@@ -603,7 +1052,46 @@ Overwrites an existing file in the filesystem.
 
 ##### EditTool
 
-Performs exact string replacements within a specific file. Planner must have already "read" the file to ensure the replacement string exists. We need to enforce the planner reads the file before, writing to it. So the tool should check the state ToolHistory to see if the last two entries involves reads to this specific file.
+Performs exact string replacements within a specific file. Uses the FileCache with intelligent LLM-based validation to enforce that files must be read before editing, ensuring the planner always works with current file content.
+
+**LLM-Based Cache Validation in PreHook:**
+
+- PreHook checks if file exists in FileCache map (using filepath as key)
+- If not cached: returns error requiring file to be read first (via Grep)
+- If cached: uses cheap LLM (Haiku) to validate cache sufficiency:
+  - Checks if cached content contains the old_string
+  - For partial cache: validates surrounding context is sufficient
+  - Determines if there's enough information to safely make the edit
+  - If insufficient: suggests specific line ranges to read
+- LLM provides intelligent validation vs rigid string matching
+- Detects if file may have changed since cached (via hash comparison)
+
+**PreHook Flow:**
+
+```go
+1. Check if file in cache → If not, error: "Must read file first"
+2. Gather all cached content (full or partial segments)
+3. Call ValidateCacheSufficiencyForEdit(filePath, oldString, newString)
+4. LLM analyzes: "Does cache contain old_string with enough context?"
+5. If insufficient: return error with suggested line ranges
+6. If sufficient: proceed with edit
+7. PostHook: Update cache with new content
+```
+
+**Partial Cache Handling:**
+
+- For partially cached files: LLM checks if segments contain target with context
+- If segment not cached or insufficient: requests specific line range
+- After edit: converts partial cache to full cache (since file is modified)
+- Ensures consistency by invalidating all partial segments after edit
+
+**Benefits of LLM Validation:**
+
+- Smarter than exact string matching
+- Understands context requirements
+- Can identify ambiguous edits requiring more context
+- Suggests specific ranges to read when insufficient
+- Very cheap (uses Haiku/mini model)
 
 ```json
 {
@@ -639,10 +1127,16 @@ A tool for making multiple edits to a single file in one operation. It is an ato
 
 **Critical Requirements:**
 
+- **LLM-Based Cache Validation:** PreHook uses cheap LLM to validate cache sufficiency for ALL edits
+  - Checks if cache contains all old_strings with sufficient context
+  - For partial cache: validates all edit locations are covered
+  - If any edit location is insufficiently cached: suggests expanded ranges
+  - Validates edits won't interfere with each other based on cached content
 - **Atomicity:** If one edit fails (e.g., a string isn't found), the entire operation fails.`
 - **Sequential Logic:** Edits are applied in order. An early edit might change the text that a later edit is looking for—plan accordingly. (Might be benefifical to carry out the edits in a loop)
 - **Strictness:** Requires absolute paths and exact whitespace matching.
 - **File Creation:** Should not be able to create new files. To create new files, use the WriteFile tool
+- **Cache Update:** Updates FileCache with final content after all edits succeed
 
 ```json
 {
@@ -803,7 +1297,7 @@ The agent is not locked to a specific mode. Each message can specify its own mod
 
 **Mode-Specific Tool Access:**
 
-- **Ask Mode & Plan Mode**: Only read-only tools (LS, Grep, Glob, ReadFile, WebFetch, ContextSummarizer, ExecuteCommand, TodoWrite)
+- **Ask Mode & Plan Mode**: Only read-only tools (LS, Grep, Glob, WebFetch, ContextSummarizer, ExecuteCommand, TodoWrite)
 - **Edit Mode**: All tools including file-writing tools (WriteFile, EditTool, MultiEditTool, InitTool)
 - **Main Agent**: Can spawn subagents via AgentTool in any mode
 - **SubAgent**: Cannot spawn subagents (AgentTool excluded when `isSubAgent = true`)
@@ -847,5 +1341,104 @@ Message 3 completes → Returns answer
 ### SafeGuards
 
 - Any commands to be executed outside of the `pwd` will need explicit approval from the user. For example if the `ODIN.md` file is in the `/users/desktop/projects/odin` folder, any command targeted at any path not prefixed by the `ODIN.md` file path will need explicit user permission.
+
+### File Cache System Summary
+
+The file cache system is integrated directly into existing tools rather than requiring a separate ReadFile tool, providing several key benefits:
+
+**Integration Approach:**
+
+- **Grep**: Automatically caches file contents when `output_mode="content"`
+- **Glob/LS**: Can check cache status and optionally cache file metadata
+- **EditTool/MultiEditTool**: Use LLM-based validation in PreHook to ensure cache sufficiency
+- **WriteFile**: Updates cache after modifications
+- **No separate ReadFile tool needed** - caching happens transparently
+
+**Partial Caching Support:**
+
+- **Read-Based Caching**: Cache structure mirrors actual tool read operations
+- **Segment-Based Storage**: Tool reads specific line ranges → cached as segments
+- **Full vs Partial**: Tool reads entire file → full cache; tool reads ranges → partial cache
+- **Smart Segment Management**: Up to 50 segments per file with LRU eviction
+- **Memory Efficient**: Only caches what was actually accessed, not entire files
+
+**Key Benefits:**
+
+1. **Prevents Redundant Reads**: Files are cached on first access via Grep, subsequent operations use cache
+2. **O(1) Lookups**: Direct map access using filepath as key
+3. **Intelligent Read-Before-Write**: EditTool PreHook uses LLM to validate cache sufficiency
+4. **Context-Aware Validation**: LLM checks if cached segments have enough context for edits
+5. **Tracks Modifications**: IsModified flag indicates files changed in current session
+6. **Smart Eviction**: Hybrid strategy prefers evicting unmodified files over modified ones
+7. **Automatic Freshness**: ModTime comparison detects external changes
+8. **Memory Bounded**: Configurable limits (100MB default, 500 files max)
+9. **Handles Large Files**: Partial caching mirrors actual line-range reads
+10. **Cost-Effective**: Uses cheapest LLM (Haiku) for validation - negligible cost
+
+**Example Flow (Small File):**
+
+```
+1. User: "Search for TODO in auth.go" (500KB file)
+2. Grep reads auth.go → Caches full content
+3. Cache state: {"/project/auth.go": {FullContent="...", IsModified=false}}
+4. User: "Replace TODO with FIXME"
+5. EditTool PreHook → Checks cache, finds auth.go ✓
+6. EditTool executes → Updates cache with new content, IsModified=true
+7. Future operations on auth.go use cached version (no disk read)
+```
+
+**Example Flow (Partial Read with Partial Cache):**
+
+```
+1. User: "Read lines 1000-1100 of logs.txt"
+2. Grep called with offset=1000, limit=100 → Reads only those lines
+3. Cache state: {"/project/logs.txt": {
+     IsPartial=true,
+     PartialCache={
+       "1000-1100": {content: "lines 1000-1100...", hash: "xyz"}
+     }
+   }}
+4. User: "Show me line 1050 with context" (lines 1045-1055)
+5. Cache hit on segment "1000-1100" (contains 1045-1055) → No disk read
+6. User: "Read lines 5000-5100"
+7. Cache miss → Grep reads lines 5000-5100, adds segment "5000-5100"
+8. Cache now has 2 segments: only 200 lines cached total
+9. No assumptions based on file size - cache mirrors actual reads
+```
+
+**Example Flow (LLM Validation in EditTool):**
+
+```
+1. User: "Replace 'oldFunc()' with 'newFunc()' in service.go"
+2. EditTool PreHook called
+3. Check cache: service.go exists with partial cache (lines 50-150, 300-400)
+4. Call ValidateCacheSufficiencyForEdit()
+5. LLM receives:
+   - old_string: "oldFunc()"
+   - Cached segments: lines 50-150, 300-400
+6. LLM analyzes and finds "oldFunc()" on line 75 (in cached segment 50-150)
+7. LLM response: {
+     "is_sufficient": true,
+     "explanation": "Found 'oldFunc()' on line 75 within cached segment with sufficient context"
+   }
+8. Validation passes → EditTool proceeds with edit
+9. File written, cache updated to full content (IsModified=true)
+
+**Counter-example (Insufficient Cache):**
+1. User: "Replace 'config.timeout' with 'config.requestTimeout'"
+2. EditTool PreHook called
+3. Check cache: config.go has partial cache (lines 1-50)
+4. LLM analyzes: "config.timeout" not found in lines 1-50
+5. LLM response: {
+     "is_sufficient": false,
+     "explanation": "String 'config.timeout' not found in cached segments",
+     "suggested_line_ranges": [
+       {"start_line": 1, "end_line": 200, "reason": "Need to search broader range"}
+     ]
+   }
+6. PreHook fails with error: "Insufficient cache. Please read lines 1-200 first."
+7. Planner sees error, calls Grep to read suggested range
+8. Retry edit → Now succeeds
+```
 
 ### Edge Cases and Considerations
